@@ -1,10 +1,6 @@
-"""
-Evaluate on ImageNet. Note that at the moment, training is not implemented (I am working on it).
-that being said, evaluation is working.
-"""
-
 import argparse
 import os
+import math
 import random
 import shutil
 import time
@@ -161,6 +157,7 @@ def main_worker(gpu, ngpus_per_node, args):
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    '''
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -177,8 +174,14 @@ def main_worker(gpu, ngpus_per_node, args):
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
+    '''
 
     cudnn.benchmark = True
+
+    torch.save({
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict()
+                }, "init_weight.pth.tar")
 
     # Data loading code
     train_img_list = glob.glob(f"{args.data}/train/*.jpg")
@@ -192,42 +195,81 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    val_transforms = transforms.Compose([
+    val_transform = transforms.Compose([
         transforms.Resize(size=(args.image_size, args.image_size), interpolation=PIL.Image.BICUBIC),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    train_dataset = EyeDataset(train_img_list, train_transform)
-    val_dataset = EyeDataset(val_img_list, val_transforms)
+    k = 10
+    part_num = math.ceil(len(train_img_list) / k)
+    cross_valid_best_loss_list = []
+    cross_valid_best_acc_list = []
+    for i in range(k):
+        checkpoint = torch.load("init_weight.pth.tar")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        sub_train_img_list = train_img_list[0:i*part_num] + train_img_list[(i+1)*part_num:]
+        sub_val_img_list = train_img_list[i*part_num:(i+1)*part_num]
+
+        train_dataset = EyeDataset(sub_train_img_list, train_transform)
+        val_dataset = EyeDataset(sub_val_img_list, val_transform)
+
+        train_sampler = None
+        train_loader = torch.utils.data.DataLoader(
+                train_dataset, batch_size=args.batch_size, shuffle=True,
+                num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        val_loader = torch.utils.data.DataLoader(
+                val_dataset, batch_size=args.batch_size, shuffle=False,
+                num_workers=args.workers, pin_memory=True)
+
+        best_loss = 10000
+        best_acc = 0
+        patience = 5
+        non_improve_count = 0
+        for epoch in range(args.epochs):
+            adjust_learning_rate(optimizer, epoch, args)
+            train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, args)
+            val_loss, val_acc = validate(val_loader, model, criterion, args)
+
+            if val_loss < best_loss:
+                best_loss = val_loss
+                best_acc = val_acc
+                non_improve_count = 0
+            else:
+                non_improve_count += 1
+
+            if (non_improve_count == patience or epoch == args.epochs - 1):
+                cross_valid_best_loss_list.append(best_loss)
+                cross_valid_best_acc_list.append(best_acc)
+
+    for i in range(k):
+        print(f"{i}:")
+        print(f" - loss: {cross_valid_best_loss_list[i]}")
+        print(f" - acc:  {cross_valid_best_acc_list[i]}")
+        print()
+
+    checkpoint = torch.load("init_weight.pth.tar")
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True)
 
-    if args.evaluate:
-        res = validate(val_loader, model, criterion, args)
-        with open('res.txt', 'w') as f:
-            print(res, file=f)
-        return
-
+    best_loss = 10000
+    best_acc = 0
     for epoch in range(args.start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch, args)
 
-        # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
-
-        # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
-
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
-
+        train_loss, train_acc = train(train_loader, model, criterion, optimizer, epoch, args)
+        # val_loss, val_acc = validate(val_loader, model, criterion, args)
+        '''
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
             save_checkpoint({
@@ -237,6 +279,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
+        '''
+    val_loss, val_acc = validate(val_loader, model, criterion, args)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -266,7 +310,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         loss.backward()
         optimizer.step()
 
-    print(f"Training loss: {total_loss / total_num:.2f} | Acc: {100.* total_correct / total_num:.2f}")
+    loss = total_loss / total_num
+    accuracy = 100. * total_correct / total_num
+    print(f"Training loss: {loss:.2f} | Acc: {accuracy:.2f}")
+
+    return loss, accuracy
 
 
 def validate(val_loader, model, criterion, args):
@@ -292,10 +340,12 @@ def validate(val_loader, model, criterion, args):
             total_num += target.size(0)
             total_correct += predicted.eq(target).sum().item()
 
-        print(f"Validation loss: {total_loss / total_num:.2f} | Acc: {100.* total_correct / total_num:.2f}")
+        loss = total_loss / total_num
+        accuracy = 100. * total_correct / total_num
+        print(f"Validation loss: {loss:.2f} | Acc: {accuracy:.2f}")
         print()
-    return 100.* total_correct / total_num
 
+    return loss, accuracy
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
